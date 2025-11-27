@@ -203,22 +203,14 @@ public class FTPClient {
         }
     }
 
-    private func readResponse() async throws -> String {
-        guard let connection = controlConnection else {
-            throw FTPError.connectionFailed("No control connection available.")
-        }
-
         var completeResponse = ""
-
+        let maxResponseLength = 64 * 1024  // 64 KB safety limit
         while true {
-            let partialResponse: String = try await withCheckedThrowingContinuation {
-                (continuation: CheckedContinuation<String, Error>) in
-
+            let partialResponse: String = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, Error>) in
                 connection.receive(minimumIncompleteLength: 1, maximumLength: 1024) { data, _, isComplete, error in
                     if let error = error {
                         continuation.resume(throwing: FTPError.connectionFailed(error.localizedDescription))
-                    } else if let data = data,
-                              let response = String(data: data, encoding: .utf8) {
+                    } else if let data = data, let response = String(data: data, encoding: .utf8) {
                         continuation.resume(returning: response)
                     } else if isComplete {
                         continuation.resume(throwing: FTPError.other("Connection closed while reading response."))
@@ -230,14 +222,18 @@ public class FTPClient {
 
             completeResponse += partialResponse
 
-            // crude “complete line” check
+            // Safety: avoid unbounded growth if the server sends malformed or
+            // extremely long responses (which can lead to huge allocations).
+            if completeResponse.count > maxResponseLength {
+                throw FTPError.other("Server response too long or malformed: \(completeResponse.prefix(200))...")
+            }
+
+            // Check if response is complete (ends with \r\n)
             if completeResponse.hasSuffix("\r\n") {
                 break
             }
         }
-
         return completeResponse
-    }
 
     // MARK: - Upload helpers
 
