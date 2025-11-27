@@ -203,8 +203,15 @@ public class FTPClient {
         }
     }
 
+
+    private func readResponse() async throws -> String {
+        guard let connection = controlConnection else {
+            throw FTPError.connectionFailed("No control connection available.")
+        }
+
         var completeResponse = ""
         let maxResponseLength = 64 * 1024  // 64 KB safety limit
+
         while true {
             let partialResponse: String = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, Error>) in
                 connection.receive(minimumIncompleteLength: 1, maximumLength: 1024) { data, _, isComplete, error in
@@ -233,7 +240,9 @@ public class FTPClient {
                 break
             }
         }
+
         return completeResponse
+    }
 
     // MARK: - Upload helpers
 
