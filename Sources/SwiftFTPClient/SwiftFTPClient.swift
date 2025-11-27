@@ -5,30 +5,6 @@ import Network
 ///
 /// This class provides functionality to connect to an FTP server, upload files or data,
 /// and manage the transfer process.
-///
-/// Example usage:
-/// ```swift
-/// let credentials = FTPCredentials(host: "ftp.example.com", port: 21, username: "user", password: "pass")
-/// let remotePath = "/upload/path"
-///
-/// let ftpClient = FTPClient(credentials: credentials, remotePath: remotePath)
-///
-/// let filesToUpload: [FTPUploadable] = [
-///     .file(url: URL(fileURLWithPath: "/path/to/local/file1.txt"), remoteFileName: "file1.txt"),
-///     .data(data: Data("Sample data".utf8), remoteFileName: "sample.txt")
-/// ]
-///
-/// ftpClient.upload(files: filesToUpload, progressHandler: { progress in
-///     print("Overall progress: \(progress.fractionCompleted * 100)%")
-/// }, completionHandler: { result in
-///     switch result {
-///     case .success:
-///         print("All files uploaded successfully.")
-///     case .failure(let error):
-///         print("An error occurred: \(error)")
-///     }
-/// })
-/// ```
 public class FTPClient {
     private let credentials: FTPCredentials
     private let remotePath: String
@@ -89,6 +65,8 @@ public class FTPClient {
         files: [FTPUploadable],
         progressHandler: @escaping (Progress) -> Void
     ) async throws {
+        isCancelled = false
+
         // Connect and authenticate
         try await connect()
 
@@ -131,7 +109,7 @@ public class FTPClient {
         }
 
         // Close control connection
-        controlConnection?.cancel()
+        await disconnect()
     }
 
     // MARK: - Connection / Commands
@@ -139,7 +117,10 @@ public class FTPClient {
     private func connect() async throws {
         let parameters = NWParameters.tcp
         let endpoint = NWEndpoint.Host(credentials.host)
-        let port = NWEndpoint.Port(rawValue: credentials.port)!
+        guard let port = NWEndpoint.Port(rawValue: credentials.port) else {
+            throw FTPError.connectionFailed("Invalid FTP port: \(credentials.port)")
+        }
+
         controlConnection = NWConnection(host: endpoint, port: port, using: parameters)
 
         try await withSafeStateHandler { completion in
@@ -158,24 +139,26 @@ public class FTPClient {
             controlConnection?.start(queue: .global())
         }
 
-        // Read the initial server response
+        // Read the initial server response (e.g. "220 ...")
         _ = try await readResponse()
 
         // USER
         try await sendCommand("USER \(credentials.username)")
         let userResponse = try await readResponse()
-        guard userResponse.starts(with: "331") else {
+        guard userResponse.starts(with: "331") || userResponse.starts(with: "230") else {
             throw FTPError.authenticationFailed("Username not accepted: \(userResponse)")
         }
 
-        // PASS
-        try await sendCommand("PASS \(credentials.password)")
-        let passResponse = try await readResponse()
-        guard passResponse.starts(with: "230") else {
-            throw FTPError.authenticationFailed("Password not accepted: \(passResponse)")
+        // PASS (only if required)
+        if userResponse.starts(with: "331") {
+            try await sendCommand("PASS \(credentials.password)")
+            let passResponse = try await readResponse()
+            guard passResponse.starts(with: "230") else {
+                throw FTPError.authenticationFailed("Password not accepted: \(passResponse)")
+            }
         }
 
-        // CWD
+        // CWD to desired remote path
         try await sendCommand("CWD \(remotePath)")
         let cwdResponse = try await readResponse()
         guard cwdResponse.starts(with: "250") else {
@@ -203,7 +186,7 @@ public class FTPClient {
         }
     }
 
-
+    /// Read a single FTP response line, with a safety limit on length.
     private func readResponse() async throws -> String {
         guard let connection = controlConnection else {
             throw FTPError.connectionFailed("No control connection available.")
@@ -235,7 +218,7 @@ public class FTPClient {
                 throw FTPError.other("Server response too long or malformed: \(completeResponse.prefix(200))...")
             }
 
-            // Check if response is complete (ends with \r\n)
+            // For standard FTP, single-line replies end with CRLF.
             if completeResponse.hasSuffix("\r\n") {
                 break
             }
@@ -263,11 +246,11 @@ public class FTPClient {
         // STOR
         try await sendCommand("STOR \(remoteFileName)")
         let storResponse = try await readResponse()
-        guard storResponse.starts(with: "150") else {
+        guard storResponse.starts(with: "150") || storResponse.starts(with: "125") else {
             throw FTPError.transferFailed("Failed to initiate file transfer: \(storResponse)")
         }
 
-        // Send file data in chunks using readData(ofLength:), which works on older iOS versions too.
+        // Send file data in chunks
         while true {
             if isCancelled {
                 dataConnection.cancel()
@@ -289,7 +272,7 @@ public class FTPClient {
 
         // Read final server response
         let transferResponse = try await readResponse()
-        guard transferResponse.starts(with: "226") else {
+        guard transferResponse.starts(with: "226") || transferResponse.starts(with: "250") else {
             throw FTPError.transferFailed("File transfer failed: \(transferResponse)")
         }
     }
@@ -306,7 +289,7 @@ public class FTPClient {
         // STOR
         try await sendCommand("STOR \(remoteFileName)")
         let storResponse = try await readResponse()
-        guard storResponse.starts(with: "150") else {
+        guard storResponse.starts(with: "150") || storResponse.starts(with: "125") else {
             throw FTPError.transferFailed("Failed to initiate data transfer: \(storResponse)")
         }
 
@@ -320,7 +303,7 @@ public class FTPClient {
 
         // Read final response
         let transferResponse = try await readResponse()
-        guard transferResponse.starts(with: "226") else {
+        guard transferResponse.starts(with: "226") || transferResponse.starts(with: "250") else {
             throw FTPError.transferFailed("Data transfer failed: \(transferResponse)")
         }
     }
